@@ -1,0 +1,228 @@
+from azuremodels import llm, embeddings
+import pandas as pd
+from typing import List, Literal, TypedDict, Optional, Annotated
+from pydantic import BaseModel, confloat
+import operator
+from langgraph.graph import StateGraph, START, END
+from langchain_community.vectorstores import Chroma
+from prompts import *
+from langchain_classic.schema import Document
+
+from langchain_classic.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
+
+
+from fastmcp import Client
+import asyncio
+
+#Pydanctic Schemas
+AssetClass = Literal[
+    "BankFD",
+    "DebtBond",
+    "MF_Index",
+    "MF_Flexi",
+    "MF_SmallCap",
+    "EQ_Banking",
+    "EQ_Automobile",
+    "EQ_IT",
+    "EQ_FMCG",
+    "EQ_MetalsMining",
+    "EQ_OilGas",
+    "EQ_Pharma",
+    "EQ_Defense",
+    "Gold",
+    "Silver",
+    "RealEstate",
+    "Cryptocurrency"
+]
+ActionType = Literal["BUY", "SELL", "HOLD"]
+
+class Transaction(BaseModel):
+    action: ActionType
+    asset_type: AssetClass
+    percentage: confloat(ge=0, le=100)
+    rationale: str
+
+class RequiredRuleKeys(BaseModel):
+    rule_keys: List[str]
+
+class CustomPortfolioPlan(BaseModel):
+    transactions: List[Transaction]
+    overall_rationale: str
+
+
+class PortfolioAgentState(TypedDict, total=False):
+    client_id: str
+    client_metadata: Optional[dict]
+    boundary_rules: Annotated[List[str], operator.add]
+    general_strategies: Optional[List[dict]]
+    portfolio_plan: Optional[CustomPortfolioPlan]
+    marketCondtions: str
+
+async def mcpconnect(clientid):
+    # Connect to the server
+    print(clientid)
+    async with Client("http://localhost:8000/mcp") as client:
+        print("Connected to MCP server!")
+
+        # List all available tools
+        tools = await client.list_tools()
+        print("Available tools:")
+        for tool in tools:
+            print(f"  - {tool.name}: {tool.description}")
+
+        print("\n")
+        print("CSVdata")
+
+        csvdata= await client.call_tool("get_client_metadata", {"ClientId":clientid})
+        print(csvdata.data)
+
+# Nodes
+def load_client_metadata_node(state):
+    print("\n=== LOAD CLIENT METADATA ===")
+    print(f"Client ID: {state['client_id']}")
+    df = pd.read_csv("client.csv")
+    match = df[df["client_id"] == state["client_id"]]
+    if match.empty:
+        raise ValueError(f"Client ID '{state['client_id']}' not found")
+    metadata = match.iloc[0].to_dict()
+    print("metadata---------------------------------")
+    print(metadata)
+    print(type(metadata))
+    try:
+        data = mcpconnect(state['client_id'])
+        print("data------------")
+        # print(data.data)
+        print(type(data))
+        metadata = data
+    except Exception as e:
+        print("❌ ERROR in /mcp connection :", e)
+        return {"status": "error", "message": str(e)}
+    print(f"Loaded: {metadata}")
+    return {"client_metadata": metadata}
+
+def select_and_retrieve_boundary_rules_node(state):
+    print("\n=== SELECT BOUNDARY RULES ===")
+    print(f"Client metadata: {state['client_metadata']}")
+    
+    structured_llm = llm.with_structured_output(RequiredRuleKeys)
+    
+    result = structured_llm.invoke(f"""
+Determine boundary rule keys for this client: {state["client_metadata"]}
+
+Return JSON with rule_keys array. Examples:
+- max_equity_for_low_risk
+- crypto_cap
+- gold_corridor
+""")
+    
+    print(f"LLM result: {result}")
+    print(f"Result type: {type(result)}")
+    
+    selected_keys = result.rule_keys if result else ["max_equity_for_low_risk", "crypto_cap"]
+    print(f"Selected keys: {selected_keys}")
+    
+    vectorstore = Chroma(
+        embedding_function=embeddings,
+        collection_name="boundaryRules",
+        persist_directory="boundaryRules"
+    )
+    
+    collected_rules = []
+    for key in selected_keys:
+        docs = vectorstore.as_retriever().invoke(key)
+        collected_rules.extend([d.page_content for d in docs])
+    
+    print(f"Collected {len(collected_rules)} rules")
+    return {"boundary_rules": collected_rules}
+
+def load_general_strategies_node(state):
+    print("\n=== LOAD STRATEGIES ===")
+    df = pd.read_csv("strategy_updated.csv")
+    strategies = df.to_dict(orient="records")
+    print(f"Loaded {len(strategies)} strategies")
+    return {"general_strategies": strategies}
+
+def generate_custom_portfolio_node(state):
+    print("\n=== GENERATE PORTFOLIO ===")
+    print(f"Client metadata exists: {state.get('client_metadata') is not None}")
+    print(f"Boundary rules count: {len(state.get('boundary_rules', []))}")
+    print(f"Strategies count: {len(state.get('general_strategies', []))}")
+    
+    structured_llm = llm.with_structured_output(CustomPortfolioPlan)
+    
+    print("Calling LLM...")
+    plan = structured_llm.invoke(CUSTOM_PORTFOLIO_GENERATOR)
+    
+    print(f"LLM returned: {plan}")
+    print(f"Plan type: {type(plan)}")
+    
+    if plan is None:
+        print("WARNING: LLM returned None!")
+    else:
+        print(f"Plan has {len(plan.transactions)} transactions")
+    
+    return {"portfolio_plan": plan}
+
+
+#Graph
+graph = StateGraph(PortfolioAgentState)
+
+graph.add_node("load_client_metadata", load_client_metadata_node)
+graph.add_node("select_boundary_rules", select_and_retrieve_boundary_rules_node)
+graph.add_node("load_general_strategies", load_general_strategies_node)
+graph.add_node("generate_custom_portfolio", generate_custom_portfolio_node)
+
+graph.add_edge(START, "load_client_metadata")
+graph.add_edge("load_client_metadata", "select_boundary_rules")
+graph.add_edge("load_client_metadata", "load_general_strategies")
+graph.add_edge("select_boundary_rules", "generate_custom_portfolio")
+graph.add_edge("load_general_strategies", "generate_custom_portfolio")
+graph.add_edge("generate_custom_portfolio", END)
+
+gapp = graph.compile()
+
+
+# marketCondtions = "Commodities display mixed signals: crude oil and energy prices are pressured by oversupply and weaker demand, while gold maintains strength as a safe-haven asset amid geopolitical and inflation uncertainties. Regulatory actions remain divided, with some rollbacks creating a more permissive environment for financial institutions, though concerns over weakening oversight persist. Recession risks appear moderate, as global growth forecasts have been slightly revised upward, supported by fiscal and monetary stimulus measures, though high-frequency indicators like consumption and employment suggest uneven recovery in certain regions. Investor sentiment is improving cautiously, with capital flows favoring undervalued assets, though volatility remains elevated due to macro and geopolitical headwinds."
+# print("Starting portfolio agent...")
+# state = app.invoke({"client_id": "CL001","marketCondtions":marketCondtions})
+
+# print("\n" + "="*60)
+# print("FINAL RESULT")
+# print("="*60)
+
+# import csv
+
+# def export_plan_to_csv(plan, client_id: str):
+#     filename = f"{client_id}.csv"
+    
+#     with open(filename, mode="w", newline="", encoding="utf-8") as f:
+#         writer = csv.writer(f)
+        
+#         # Header row
+#         writer.writerow(["asset_type", "action", "percentage", "rationale"])
+        
+#         # Transaction rows
+#         for txn in plan.transactions:
+#             writer.writerow([
+#                 txn.asset_type,
+#                 txn.action,
+#                 txn.percentage,
+#                 txn.rationale
+#             ])
+    
+#     print(f"Portfolio CSV saved as: {filename}")
+
+
+# if state.get("portfolio_plan"):
+#     plan = state["portfolio_plan"]
+#     print(f"\nOverall Rationale: {plan.overall_rationale}")
+#     print(f"\nTransactions:")
+#     for txn in plan.transactions:
+#         print(f"  - {txn.asset_type}: {txn.action} {txn.percentage}% ({txn.rationale})")
+#     export_plan_to_csv(plan, state["client_id"])
+# else:
+#     print("\nERROR: No portfolio plan generated!")
+#     print(f"Full state keys: {state.keys()}")
+#     for key, value in state.items():
+#         print(f"{key}: {value}")
